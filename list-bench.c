@@ -9,111 +9,40 @@
 #endif
 
 #include <assert.h>
+#include <inttypes.h>
 #include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
 #include <threads.h>
 #include <time.h>
 #include <urcu.h>
 #include <urcu/cds.h>
 #include <uv.h>
 
-enum {
-	MS_PER_SEC = 1000,		 /*%< Milliseonds per second. */
-	US_PER_MS = 1000,		 /*%< Microseconds per millisecond. */
-	US_PER_SEC = 1000 * 1000,	 /*%< Microseconds per second. */
-	NS_PER_US = 1000,		 /*%< Nanoseconds per microsecond. */
-	NS_PER_MS = 1000 * 1000,	 /*%< Nanoseconds per millisecond. */
-	NS_PER_SEC = 1000 * 1000 * 1000, /*%< Nanoseconds per second. */
-};
-
-#if defined(CLOCK_REALTIME)
-#define CLOCKSOURCE CLOCK_REALTIME
-#elif defined(CLOCK_REALTIME_COARSE)
-#define CLOCKSOURCE CLOCK_REALTIME_COARSE
-#elif defined(CLOCK_REALTIME_FAST)
-#define CLOCKSOURCE CLOCK_REALTIME_FAST
-#else /* if defined(CLOCK_REALTIME_COARSE) */
-#define CLOCKSOURCE CLOCK_REALTIME
-#endif /* if defined(CLOCK_REALTIME_COARSE) */
-
-static thread_local uint32_t seed[4] = { 0 };
-
-void random_init(void) {
-	int r = uv_random(NULL, NULL, seed, sizeof(seed), 0, NULL);
-	assert(r == 0);
-}
-
-static uint32_t
-rotl(const uint32_t x, int k) {
-	return ((x << k) | (x >> (32 - k)));
-}
-
-static uint32_t
-next(void) {
-	uint32_t result_starstar, t;
-
-	result_starstar = rotl(seed[0] * 5, 7) * 9;
-	t = seed[1] << 9;
-
-	seed[2] ^= seed[0];
-	seed[3] ^= seed[1];
-	seed[1] ^= seed[2];
-	seed[0] ^= seed[3];
-
-	seed[2] ^= t;
-
-	seed[3] = rotl(seed[3], 11);
-
-	return (result_starstar);
-}
-
-uint8_t
-random8(void) {
-	return ((uint8_t)next());
-}
-
-static void
-time_now(struct timespec *ts) {
-	int r = clock_gettime(CLOCKSOURCE, ts);
-	assert(r == 0);
-}
-
-uint64_t
-time_microdiff(const struct timespec *t1, const struct timespec *t2) {
-	uint64_t i1 = (uint64_t)t1->tv_sec * NS_PER_SEC + t1->tv_nsec;
-	uint64_t i2 = (uint64_t)t2->tv_sec * NS_PER_SEC + t2->tv_nsec;
-
-	assert(i1 >= i2);
-
-	return (i1 - i2) / NS_PER_US;
-}
+#include "rwlock.h"
+#include "util.h"
 
 struct thread_s {
-	union {
-		struct {
-			uv_thread_t thread;
-			uv_mutex_t *mutex;
-			uv_rwlock_t *rwlock;
-			uv_barrier_t *barrier;
-			uv_thread_cb cb;
-			uint64_t ops;
-			uint8_t rws;
-			uint64_t diff;
-			void *data;
-		};
-		uint8_t __padding[64];
-	};
+	uv_thread_t thread;
+	uv_mutex_t *mutex;
+	pthread_rwlock_t *rwlock;
+	uv_barrier_t *barrier;
+	uv_thread_cb cb;
+	rwlock_t *crwwp;
+	uint64_t ops;
+	uint64_t reads;
+	uint64_t writes;
+	uint64_t diff;
+	uint8_t rws;
+	void *data;
 };
-
-static bool
-is_write(uint8_t num, uint8_t percent) {
-	uint32_t tmp = (num * 100) / 256;
-
-	return tmp <= percent;
-}
 
 struct data {
+	uint64_t value; /* Node content */
 	struct cds_list_head head;
 };
+
+static bool *rnd;
 
 static void
 mutex_list_run(void *arg0) {
@@ -121,19 +50,19 @@ mutex_list_run(void *arg0) {
 	struct timespec start, end;
 	struct cds_list_head *head = arg->data;
 
-	random_init();
-
 	(void)uv_barrier_wait(arg->barrier);
 
 	time_now(&start);
 
 	for (size_t i = 0; i < arg->ops; i++) {
-		if (is_write(random8(), arg->rws)) {
-			uv_mutex_lock(arg->mutex);
+		if (rnd[i]) {
+			arg->writes++;
 			struct data *newdata = malloc(sizeof(*newdata));
+			uv_mutex_lock(arg->mutex);
 			cds_list_add(&newdata->head, head);
 			uv_mutex_unlock(arg->mutex);
 		} else {
+			arg->reads++;
 			uv_mutex_lock(arg->mutex);
 			struct cds_list_head *pos, *p;
 			cds_list_for_each_safe(pos, p, head);
@@ -152,23 +81,54 @@ rwlock_list_run(void *arg0) {
 	struct timespec start, end;
 	struct cds_list_head *head = arg->data;
 
-	random_init();
+	(void)uv_barrier_wait(arg->barrier);
+
+	time_now(&start);
+
+	for (size_t i = 0; i < arg->ops; i++) {
+		if (rnd[i]) {
+			arg->writes++;
+			struct data *newdata = malloc(sizeof(*newdata));
+			pthread_rwlock_wrlock(arg->rwlock);
+			cds_list_add(&newdata->head, head);
+			pthread_rwlock_unlock(arg->rwlock);
+		} else {
+			arg->reads++;
+			pthread_rwlock_rdlock(arg->rwlock);
+			struct cds_list_head *pos, *p;
+			cds_list_for_each_safe(pos, p, head);
+			pthread_rwlock_unlock(arg->rwlock);
+		}
+	}
+
+	time_now(&end);
+
+	arg->diff = time_microdiff(&end, &start);
+}
+
+static void
+crwwp_list_run(void *arg0) {
+	struct thread_s *arg = arg0;
+	struct timespec start, end;
+	struct cds_list_head *head = arg->data;
 
 	(void)uv_barrier_wait(arg->barrier);
 
 	time_now(&start);
 
 	for (size_t i = 0; i < arg->ops; i++) {
-		if (is_write(random8(), arg->rws)) {
-			uv_rwlock_wrlock(arg->rwlock);
+		if (rnd[i]) {
+			arg->writes++;
 			struct data *newdata = malloc(sizeof(*newdata));
+			rwlock_wrlock(arg->crwwp);
 			cds_list_add(&newdata->head, head);
-			uv_rwlock_wrunlock(arg->rwlock);
+			rwlock_wrunlock(arg->crwwp);
 		} else {
-			uv_rwlock_rdlock(arg->rwlock);
+			arg->reads++;
+			rwlock_rdlock(arg->crwwp);
 			struct cds_list_head *pos, *p;
 			cds_list_for_each_safe(pos, p, head);
-			uv_rwlock_rdunlock(arg->rwlock);
+			rwlock_rdunlock(arg->crwwp);
 		}
 	}
 
@@ -184,19 +144,19 @@ rcu_list_run(void *arg0) {
 	struct cds_list_head *head = arg->data;
 
 	rcu_register_thread();
-	random_init();
-
 	(void)uv_barrier_wait(arg->barrier);
 
 	time_now(&start);
 
 	for (size_t i = 0; i < arg->ops; i++) {
-		if (is_write(random8(), arg->rws)) {
-			uv_mutex_lock(arg->mutex);
+		if (rnd[i]) {
+			arg->writes++;
 			struct data *newdata = malloc(sizeof(*newdata));
+			uv_mutex_lock(arg->mutex);
 			cds_list_add_rcu(&newdata->head, head);
 			uv_mutex_unlock(arg->mutex);
 		} else {
+			arg->reads++;
 			rcu_read_lock();
 			struct cds_list_head *pos, *p;
 			cds_list_for_each_safe(pos, p, head);
@@ -211,13 +171,11 @@ rcu_list_run(void *arg0) {
 	rcu_unregister_thread();
 }
 
-#define NUM_THREADS 128
-
-struct thread_s threads[NUM_THREADS];
+struct thread_s *threads;
 
 void
 usage(int argc [[maybe_unused]], char **argv) {
-	fprintf(stderr, "usage: %s <num_threads> <num_ops> <read_write_ratio>\n", argv[0]);
+	fprintf(stderr, "usage: %s <num_threads> <num_ops> <read_write_ratio> [<r|w|n>]\n", argv[0]);
 }
 
 struct test {
@@ -249,6 +207,7 @@ list_destroy(void *arg) {
 static struct test test_list[] = {
 	{ "mutex", list_new, mutex_list_run, list_destroy },
 	{ "rwlock", list_new, rwlock_list_run, list_destroy },
+	{ "c-rw-wp", list_new, crwwp_list_run, list_destroy },
 	{ "rcu", list_new, rcu_list_run, list_destroy },
 	{ NULL, NULL, NULL, NULL },
 };
@@ -263,11 +222,51 @@ main(int argc, char **argv) {
 	uint8_t num_threads = atoi(argv[1]);
 	uint64_t num_ops = atoll(argv[2]);
 	uint8_t rws = atoi(argv[3]);
+	uint64_t writes = 0;
+	uint64_t reads = 0;
+	pthread_rwlockattr_t attr;
+
+	if (argc > 4) {
+		int r;
+		if (argv[4][0] == 'r') {
+			r = pthread_rwlockattr_setkind_np(&attr, PTHREAD_RWLOCK_PREFER_READER_NP);
+		} else if (argv[4][0] == 'w') {
+			r = pthread_rwlockattr_setkind_np(&attr, PTHREAD_RWLOCK_PREFER_WRITER_NP);
+		} else if (argv[4][0] == 'n') {
+			r = pthread_rwlockattr_setkind_np(&attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+		} else {
+			usage(argc, argv);
+			exit(1);
+		}
+
+		assert(r == 0);
+	}
+
+	random_init();
+
+	threads = calloc(num_threads, sizeof(threads[0]));
+
+	rnd = calloc(num_ops, sizeof(*rnd));
+	random_buf(rnd, num_ops * sizeof(*rnd));
+
+	uint32_t tmp = (rws * 255) / 100;
+	for (size_t i = 0; i < num_ops; i++) {
+		if (rnd[i] < tmp) {
+			writes++;
+			rnd[i] = true;
+		} else {
+			reads++;
+			rnd[i] = false;
+		}
+	}
+
+	printf("%10s | %10s | %10s | %10s | %10s \n", "", "threads", "reads", "writes", "seconds");
 
 	for (struct test *test = test_list; test->name != NULL; test++) {
 		uv_mutex_t mutex;
-		uv_rwlock_t rwlock;
+		pthread_rwlock_t rwlock;
 		uv_barrier_t barrier;
+		rwlock_t crwwp;
 
 		int r = uv_barrier_init(&barrier, num_threads);
 		assert(r == 0);
@@ -275,8 +274,11 @@ main(int argc, char **argv) {
 		r = uv_mutex_init(&mutex);
 		assert(r == 0);
 
-		r = uv_rwlock_init(&rwlock);
+		r = pthread_rwlock_init(&rwlock, &attr);
 		assert(r == 0);
+
+		rwlock_setworkers(num_threads);
+		rwlock_init(&crwwp);
 
 		void *data = test->new();
 
@@ -286,6 +288,7 @@ main(int argc, char **argv) {
 				.barrier = &barrier,
 				.mutex = &mutex,
 				.rwlock = &rwlock,
+				.crwwp = &crwwp,
 				.ops = num_ops,
 				.rws = rws,
 				.data = data,
@@ -296,24 +299,31 @@ main(int argc, char **argv) {
 		}
 
 		uint64_t diff = 0;
+		writes = 0;
+		reads = 0;
 		for (size_t i = 0; i < num_threads; i++) {
 			struct thread_s *t = &threads[i];
 			r = uv_thread_join(&t->thread);
 			assert(r == 0);
 
 			diff += t->diff;
+			writes += t->writes;
+			reads += t->reads;
 		}
 
-		printf("%10s | %10zu | %10.4f \n", test->name, (size_t)num_threads,
-		       (double)(diff / num_threads) / (1000.0 * 1000.0)
-
-		);
+		printf("%10s | %10zu | %10" PRIu64 " | %10" PRIu64 " | %10.4f \n", test->name, (size_t)num_threads,
+		       reads, writes, (double)(diff / num_threads) / (US_PER_SEC));
 
 		test->destroy(data);
 
+		rwlock_destroy(&crwwp);
 		uv_mutex_destroy(&mutex);
-		uv_rwlock_destroy(&rwlock);
+		pthread_rwlock_destroy(&rwlock);
 		uv_barrier_destroy(&barrier);
 	}
+
+	free(rnd);
+	free(threads);
+
 	return 0;
 }

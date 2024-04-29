@@ -10,7 +10,7 @@ urcu_dep = dependency('liburcu-memb')
 urcu_cds_dep = dependency('liburcu-cds')
 jemalloc_dep = dependency('jemalloc')
 
-executable('list-bench', ['list-bench.c'],
+executable('list-bench', ['list-bench.c', 'pause.h', 'rwlock.h', 'rwlock.c', 'util.h'],
            dependencies : [
              thread_dep,
              jemalloc_dep,
@@ -20,7 +20,7 @@ executable('list-bench', ['list-bench.c'],
            ],
           )
 
-executable('queue-bench', ['queue-bench.c'],
+executable('queue-bench', ['queue-bench.c', 'pause.h', 'rwlock.h', 'rwlock.c', 'util.h'],
            dependencies : [
              thread_dep,
              jemalloc_dep,
