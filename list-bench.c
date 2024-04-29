@@ -240,6 +240,9 @@ main(int argc, char **argv) {
 		}
 
 		assert(r == 0);
+	} else {
+		int r = pthread_rwlockattr_setkind_np(&attr, PTHREAD_RWLOCK_PREFER_READER_NP);
+		assert(r == 0);
 	}
 
 	random_init();
